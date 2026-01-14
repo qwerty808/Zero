@@ -9,7 +9,6 @@ from datetime import time, timezone
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -32,16 +31,16 @@ HELP_TEXT = """
 Я бот‑трекер привычек и задач.
 
 Привычки:
-  /addhabit <название> — добавить привычку
+  /addhabit «название» — добавить привычку
   /habits — список привычек (с кнопками “✅ Сделано”)
-  /habitdone <id> — отметить привычку выполненной сегодня
-  /delhabit <id> — удалить (деактивировать) привычку
+  /habitdone «id» — отметить привычку выполненной сегодня
+  /delhabit «id» — удалить (деактивировать) привычку
 
 Задачи:
-  /addtask <текст> — добавить задачу
+  /addtask «текст» — добавить задачу
   /tasks — список задач (с кнопками “✅ Готово”)
-  /taskdone <id> — закрыть задачу
-  /deltask <id> — удалить задачу
+  /taskdone «id» — закрыть задачу
+  /deltask «id» — удалить задачу
 
 Напоминания (время в UTC):
   /setreminder HH:MM — ежедневное напоминание
@@ -143,7 +142,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(  # type: ignore[union-attr]
         "Привет! Я помогу вести привычки и задачи.\n\n" + HELP_TEXT,
-        parse_mode=ParseMode.HTML,
     )
 
 
