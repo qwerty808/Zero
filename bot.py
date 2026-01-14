@@ -316,8 +316,14 @@ async def cmd_habitdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("id должен быть числом.")  # type: ignore[union-attr]
         return
 
-    ok = await _db_call(state, state.db.mark_habit_done_today, telegram_id, hid)
-    await update.message.reply_text("Отметил ✅" if ok else "Не нашёл привычку.")  # type: ignore[union-attr]
+    status = await _db_call(state, state.db.mark_habit_done_today_status, telegram_id, hid)
+    if status == "marked":
+        msg = "Отметил ✅"
+    elif status == "already":
+        msg = "Уже было отмечено ✅"
+    else:
+        msg = "Не нашёл привычку."
+    await update.message.reply_text(msg)  # type: ignore[union-attr]
 
 
 async def cmd_delhabit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -373,8 +379,14 @@ async def cmd_taskdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("id должен быть числом.")  # type: ignore[union-attr]
         return
 
-    ok = await _db_call(state, state.db.mark_task_done, telegram_id, tid)
-    await update.message.reply_text("Готово ✅" if ok else "Не нашёл задачу.")  # type: ignore[union-attr]
+    status = await _db_call(state, state.db.mark_task_done_status, telegram_id, tid)
+    if status == "marked":
+        msg = "Готово ✅"
+    elif status == "already":
+        msg = "Уже готово ✅"
+    else:
+        msg = "Не нашёл задачу."
+    await update.message.reply_text(msg)  # type: ignore[union-attr]
 
 
 async def cmd_deltask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -619,8 +631,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except ValueError:
             await query.answer("Некорректный id.")
             return
-        ok = await _db_call(state, state.db.mark_habit_done_today, telegram_id, hid)
-        await query.answer("Отмечено ✅" if ok else "Не нашёл привычку.")
+        status = await _db_call(state, state.db.mark_habit_done_today_status, telegram_id, hid)
+        if status == "not_found":
+            await query.answer("Не нашёл привычку.")
+            return
+        if status == "already":
+            # Avoid spamming: message would be unchanged -> Telegram throws "message is not modified"
+            await query.answer("Уже отмечено ✅")
+            return
+
+        await query.answer("Отмечено ✅")
         habits = await _db_call(state, state.db.list_habits, telegram_id)
         text = _habits_text(habits)
         kb = _habits_keyboard(habits)
@@ -637,8 +657,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except ValueError:
             await query.answer("Некорректный id.")
             return
-        ok = await _db_call(state, state.db.mark_task_done, telegram_id, tid)
-        await query.answer("Готово ✅" if ok else "Не нашёл задачу.")
+        status = await _db_call(state, state.db.mark_task_done_status, telegram_id, tid)
+        if status == "not_found":
+            await query.answer("Не нашёл задачу.")
+            return
+        await query.answer("Готово ✅" if status == "marked" else "Уже готово ✅")
         tasks = await _db_call(state, state.db.list_tasks, telegram_id, False)
         text = _tasks_text(tasks)
         kb = _tasks_keyboard(tasks)
