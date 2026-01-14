@@ -4,7 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 
 def _utc_now_iso() -> str:
@@ -242,6 +242,33 @@ class Database:
             # already marked for today
             return True
 
+    def mark_habit_done_today_status(
+        self, telegram_id: int, habit_id: int
+    ) -> Literal["marked", "already", "not_found"]:
+        # Verify ownership
+        row = self._execute(
+            """
+            SELECT h.id
+            FROM habits h
+            JOIN users u ON u.id=h.user_id
+            WHERE h.id=? AND u.telegram_id=? AND h.is_active=1
+            """,
+            (habit_id, telegram_id),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+
+        try:
+            self._execute(
+                "INSERT INTO habit_logs (habit_id, done_date, created_at) VALUES (?, ?, ?)",
+                (habit_id, _today_iso(), _utc_now_iso()),
+            )
+            self._conn.commit()
+            return "marked"
+        except sqlite3.IntegrityError:
+            # already marked for today
+            return "already"
+
     def add_task(self, telegram_id: int, chat_id: int, text: str) -> int:
         user_id = self.get_or_create_user(telegram_id, chat_id)
         cur = self._execute(
@@ -300,6 +327,34 @@ class Database:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def mark_task_done_status(self, telegram_id: int, task_id: int) -> Literal["marked", "already", "not_found"]:
+        row = self._execute(
+            """
+            SELECT t.is_done
+            FROM tasks t
+            JOIN users u ON u.id=t.user_id
+            WHERE t.id=? AND u.telegram_id=?
+            """,
+            (task_id, telegram_id),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        is_done = bool(int(row["is_done"]))
+        if is_done:
+            return "already"
+
+        self._execute(
+            """
+            UPDATE tasks
+            SET is_done=1, done_at=?
+            WHERE id=?
+              AND user_id=(SELECT id FROM users WHERE telegram_id=?)
+            """,
+            (_utc_now_iso(), task_id, telegram_id),
+        )
+        self._conn.commit()
+        return "marked"
 
     def delete_task(self, telegram_id: int, task_id: int) -> bool:
         cur = self._execute(
