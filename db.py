@@ -201,7 +201,6 @@ class Database:
         ).fetchall()
 
         today = date.today()
-        today_iso = today.isoformat()
         out: list[HabitView] = []
         for r in rows:
             hid = int(r["id"])
@@ -318,3 +317,192 @@ class Database:
         habits = self.list_habits(telegram_id)
         tasks = self.list_tasks(telegram_id, include_done=False)
         return habits, tasks
+
+    def get_stats(self, telegram_id: int) -> dict[str, Any]:
+        """
+        Returns aggregated stats for UI.
+
+        Notes:
+        - Habit logs store dates (YYYY-MM-DD) in local 'today' terms.
+        - Task done_at is UTC ISO like YYYY-MM-DDTHH:MM:SSZ (we group by date prefix).
+        """
+        today = date.today()
+        start_7 = (today - timedelta(days=6)).isoformat()
+        start_30 = (today - timedelta(days=29)).isoformat()
+
+        # Habits list (includes streak + done_today)
+        habits = self.list_habits(telegram_id)
+        habits_by_id = {h.id: h for h in habits}
+
+        # Per-habit totals (total_done, last_done, done_today flag)
+        habit_rows = self._execute(
+            """
+            SELECT
+              h.id AS id,
+              h.name AS name,
+              COUNT(hl.id) AS total_done,
+              MAX(hl.done_date) AS last_done,
+              COALESCE(SUM(CASE WHEN hl.done_date=? THEN 1 ELSE 0 END), 0) AS done_today
+            FROM habits h
+            JOIN users u ON u.id=h.user_id
+            LEFT JOIN habit_logs hl ON hl.habit_id=h.id
+            WHERE u.telegram_id=? AND h.is_active=1
+            GROUP BY h.id, h.name
+            ORDER BY h.id ASC
+            """,
+            (today.isoformat(), telegram_id),
+        ).fetchall()
+        per_habit: list[dict[str, Any]] = []
+        for r in habit_rows:
+            hid = int(r["id"])
+            hv = habits_by_id.get(hid)
+            per_habit.append(
+                {
+                    "id": hid,
+                    "name": str(r["name"]),
+                    "total_done": int(r["total_done"] or 0),
+                    "last_done": str(r["last_done"]) if r["last_done"] is not None else None,
+                    "done_today": bool(int(r["done_today"] or 0)),
+                    "streak": hv.streak if hv else 0,
+                }
+            )
+
+        # Habit totals
+        habits_total = len(habits)
+        habits_done_today = sum(1 for h in habits if h.done_today)
+
+        habit_checks_total_row = self._execute(
+            """
+            SELECT COALESCE(COUNT(*), 0) AS c
+            FROM habit_logs hl
+            JOIN habits h ON h.id=hl.habit_id
+            JOIN users u ON u.id=h.user_id
+            WHERE u.telegram_id=? AND h.is_active=1
+            """,
+            (telegram_id,),
+        ).fetchone()
+        habit_checks_total = int(habit_checks_total_row["c"]) if habit_checks_total_row else 0
+
+        habit_checks_7_row = self._execute(
+            """
+            SELECT COALESCE(COUNT(*), 0) AS c
+            FROM habit_logs hl
+            JOIN habits h ON h.id=hl.habit_id
+            JOIN users u ON u.id=h.user_id
+            WHERE u.telegram_id=? AND h.is_active=1 AND hl.done_date >= ?
+            """,
+            (telegram_id, start_7),
+        ).fetchone()
+        habit_checks_7 = int(habit_checks_7_row["c"]) if habit_checks_7_row else 0
+
+        habit_checks_30_row = self._execute(
+            """
+            SELECT COALESCE(COUNT(*), 0) AS c
+            FROM habit_logs hl
+            JOIN habits h ON h.id=hl.habit_id
+            JOIN users u ON u.id=h.user_id
+            WHERE u.telegram_id=? AND h.is_active=1 AND hl.done_date >= ?
+            """,
+            (telegram_id, start_30),
+        ).fetchone()
+        habit_checks_30 = int(habit_checks_30_row["c"]) if habit_checks_30_row else 0
+
+        habit_daily_rows = self._execute(
+            """
+            SELECT hl.done_date AS d, COUNT(*) AS c
+            FROM habit_logs hl
+            JOIN habits h ON h.id=hl.habit_id
+            JOIN users u ON u.id=h.user_id
+            WHERE u.telegram_id=? AND h.is_active=1 AND hl.done_date >= ?
+            GROUP BY hl.done_date
+            ORDER BY hl.done_date ASC
+            """,
+            (telegram_id, start_7),
+        ).fetchall()
+        habit_daily_map = {str(r["d"]): int(r["c"]) for r in habit_daily_rows}
+
+        # Tasks totals (open/done)
+        task_totals_row = self._execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN t.is_done=0 THEN 1 ELSE 0 END), 0) AS open_cnt,
+              COALESCE(SUM(CASE WHEN t.is_done=1 THEN 1 ELSE 0 END), 0) AS done_cnt,
+              COALESCE(COUNT(*), 0) AS total_cnt
+            FROM tasks t
+            JOIN users u ON u.id=t.user_id
+            WHERE u.telegram_id=?
+            """,
+            (telegram_id,),
+        ).fetchone()
+        tasks_open = int(task_totals_row["open_cnt"]) if task_totals_row else 0
+        tasks_done_total = int(task_totals_row["done_cnt"]) if task_totals_row else 0
+        tasks_total = int(task_totals_row["total_cnt"]) if task_totals_row else 0
+
+        tasks_done_7_row = self._execute(
+            """
+            SELECT COALESCE(COUNT(*), 0) AS c
+            FROM tasks t
+            JOIN users u ON u.id=t.user_id
+            WHERE u.telegram_id=? AND t.is_done=1 AND t.done_at IS NOT NULL
+              AND substr(t.done_at, 1, 10) >= ?
+            """,
+            (telegram_id, start_7),
+        ).fetchone()
+        tasks_done_7 = int(tasks_done_7_row["c"]) if tasks_done_7_row else 0
+
+        tasks_done_30_row = self._execute(
+            """
+            SELECT COALESCE(COUNT(*), 0) AS c
+            FROM tasks t
+            JOIN users u ON u.id=t.user_id
+            WHERE u.telegram_id=? AND t.is_done=1 AND t.done_at IS NOT NULL
+              AND substr(t.done_at, 1, 10) >= ?
+            """,
+            (telegram_id, start_30),
+        ).fetchone()
+        tasks_done_30 = int(tasks_done_30_row["c"]) if tasks_done_30_row else 0
+
+        task_daily_rows = self._execute(
+            """
+            SELECT substr(t.done_at, 1, 10) AS d, COUNT(*) AS c
+            FROM tasks t
+            JOIN users u ON u.id=t.user_id
+            WHERE u.telegram_id=? AND t.is_done=1 AND t.done_at IS NOT NULL
+              AND substr(t.done_at, 1, 10) >= ?
+            GROUP BY substr(t.done_at, 1, 10)
+            ORDER BY d ASC
+            """,
+            (telegram_id, start_7),
+        ).fetchall()
+        task_daily_map = {str(r["d"]): int(r["c"]) for r in task_daily_rows}
+
+        # Fill last 7 days series (oldest -> newest)
+        last7: list[dict[str, Any]] = []
+        for i in range(6, -1, -1):
+            d = (today - timedelta(days=i)).isoformat()
+            last7.append(
+                {
+                    "date": d,
+                    "habit_checks": int(habit_daily_map.get(d, 0)),
+                    "tasks_done": int(task_daily_map.get(d, 0)),
+                }
+            )
+
+        best_streak = max((h.streak for h in habits), default=0)
+
+        return {
+            "habits_total": habits_total,
+            "habits_done_today": habits_done_today,
+            "habits_pending_today": max(habits_total - habits_done_today, 0),
+            "habit_checks_total": habit_checks_total,
+            "habit_checks_7": habit_checks_7,
+            "habit_checks_30": habit_checks_30,
+            "tasks_total": tasks_total,
+            "tasks_open": tasks_open,
+            "tasks_done_total": tasks_done_total,
+            "tasks_done_7": tasks_done_7,
+            "tasks_done_30": tasks_done_30,
+            "best_streak": best_streak,
+            "per_habit": per_habit,
+            "last7": last7,
+        }

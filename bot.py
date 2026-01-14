@@ -8,13 +8,21 @@ from dataclasses import dataclass
 from datetime import time, timezone
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from db import Database, HabitView, TaskView
@@ -29,6 +37,9 @@ logger = logging.getLogger("habit-task-bot")
 
 HELP_TEXT = """
 Я бот‑трекер привычек и задач.
+
+Меню:
+  /menu — показать кнопки (быстро добавить/посмотреть/статистика)
 
 Привычки:
   /addhabit «название» — добавить привычку
@@ -48,6 +59,9 @@ HELP_TEXT = """
 
 Дополнительно:
   /summary — короткая сводка (что осталось на сегодня)
+  /stats — подробная статистика
+  /stats_short — краткая статистика
+  /cancel — отменить ввод (если бот ждёт текст)
   /help — помощь
 """.strip()
 
@@ -61,6 +75,22 @@ class BotState:
     db_lock: asyncio.Lock
 
 
+BTN_ADD_TASK = "➕ Задача"
+BTN_ADD_HABIT = "➕ Привычка"
+BTN_TASKS = "📋 Задачи"
+BTN_HABITS = "🔥 Привычки"
+BTN_SUMMARY = "📌 Сводка"
+BTN_STATS = "📊 Статистика"
+BTN_STATS_SHORT = "📊 Кратко"
+BTN_REMINDER = "⏰ Напоминание"
+BTN_HELP = "❓ Помощь"
+BTN_CANCEL = "❌ Отмена"
+
+AWAITING_KEY = "awaiting"
+AWAIT_TASK = "task"
+AWAIT_HABIT = "habit"
+
+
 def _parse_hhmm_utc(hhmm: str) -> time | None:
     m = TIME_RE.match(hhmm.strip())
     if not m:
@@ -72,7 +102,7 @@ def _parse_hhmm_utc(hhmm: str) -> time | None:
 
 def _habits_text(habits: list[HabitView]) -> str:
     if not habits:
-        return "Привычек пока нет. Добавь: /addhabit <название>"
+        return "Привычек пока нет. Добавь: /addhabit «название»"
 
     lines = ["Твои привычки:"]
     for h in habits:
@@ -80,19 +110,19 @@ def _habits_text(habits: list[HabitView]) -> str:
         last = h.last_done if h.last_done else "никогда"
         lines.append(f"#{h.id} — {h.name} | стрик: {h.streak} | сегодня: {done} | последний: {last}")
     lines.append("")
-    lines.append("Отметить: /habitdone <id>  |  Удалить: /delhabit <id>")
+    lines.append("Отметить: /habitdone «id»  |  Удалить: /delhabit «id»")
     return "\n".join(lines)
 
 
 def _tasks_text(tasks: list[TaskView]) -> str:
     if not tasks:
-        return "Задач пока нет. Добавь: /addtask <текст>"
+        return "Задач пока нет. Добавь: /addtask «текст»"
 
     lines = ["Твои задачи:"]
     for t in tasks:
         lines.append(f"#{t.id} — {t.text}")
     lines.append("")
-    lines.append("Закрыть: /taskdone <id>  |  Удалить: /deltask <id>")
+    lines.append("Закрыть: /taskdone «id»  |  Удалить: /deltask «id»")
     return "\n".join(lines)
 
 
@@ -135,6 +165,97 @@ def _user_ids(update: Update) -> tuple[int, int]:
     return int(tg_id), int(chat_id)
 
 
+def _main_menu() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(BTN_ADD_TASK), KeyboardButton(BTN_ADD_HABIT)],
+        [KeyboardButton(BTN_TASKS), KeyboardButton(BTN_HABITS)],
+        [KeyboardButton(BTN_SUMMARY), KeyboardButton(BTN_STATS)],
+        [KeyboardButton(BTN_STATS_SHORT), KeyboardButton(BTN_REMINDER)],
+        [KeyboardButton(BTN_HELP), KeyboardButton(BTN_CANCEL)],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+
+def _spark_bar(value: int, max_value: int, width: int = 10) -> str:
+    if max_value <= 0:
+        return "▱" * width
+    filled = int(round((value / max_value) * width))
+    filled = max(0, min(width, filled))
+    return ("▰" * filled) + ("▱" * (width - filled))
+
+
+def _stats_short_text(stats: dict) -> str:
+    h_done = int(stats["habits_done_today"])
+    h_total = int(stats["habits_total"])
+    t_open = int(stats["tasks_open"])
+    t_done_total = int(stats["tasks_done_total"])
+    h7 = int(stats["habit_checks_7"])
+    t7 = int(stats["tasks_done_7"])
+    best_streak = int(stats["best_streak"])
+
+    lines = [
+        "Краткая статистика:",
+        f"🔥 Привычки сегодня: {h_done}/{h_total} | лучший стрик: {best_streak}",
+        f"✅ Задачи: открыто {t_open} | сделано всего {t_done_total}",
+        f"📈 За 7 дней: отметок привычек {h7} | закрыто задач {t7}",
+    ]
+    return "\n".join(lines)
+
+
+def _stats_detailed_text(stats: dict) -> str:
+    h_total = int(stats["habits_total"])
+    h_done = int(stats["habits_done_today"])
+    h_pending = int(stats["habits_pending_today"])
+    h_total_checks = int(stats["habit_checks_total"])
+    h7 = int(stats["habit_checks_7"])
+    h30 = int(stats["habit_checks_30"])
+
+    t_total = int(stats["tasks_total"])
+    t_open = int(stats["tasks_open"])
+    t_done_total = int(stats["tasks_done_total"])
+    t7 = int(stats["tasks_done_7"])
+    t30 = int(stats["tasks_done_30"])
+
+    last7 = list(stats["last7"])
+    max_h = max((int(x["habit_checks"]) for x in last7), default=0)
+    max_t = max((int(x["tasks_done"]) for x in last7), default=0)
+
+    lines: list[str] = []
+    lines.append("📊 Подробная статистика")
+    lines.append("")
+    lines.append("Привычки:")
+    lines.append(f"- Активных: {h_total}")
+    lines.append(f"- Сегодня: сделано {h_done}, осталось {h_pending}")
+    lines.append(f"- Отметок всего: {h_total_checks}")
+    lines.append(f"- Отметок за 7 дней: {h7} | за 30 дней: {h30}")
+    lines.append("")
+    lines.append("Задачи:")
+    lines.append(f"- Всего: {t_total}")
+    lines.append(f"- Открытых: {t_open}")
+    lines.append(f"- Сделано всего: {t_done_total}")
+    lines.append(f"- Закрыто за 7 дней: {t7} | за 30 дней: {t30}")
+    lines.append("")
+    lines.append("Тренд (последние 7 дней):")
+    for d in last7:
+        day = str(d["date"])[5:]  # MM-DD
+        hc = int(d["habit_checks"])
+        td = int(d["tasks_done"])
+        lines.append(f"{day}  H {hc:>2} {_spark_bar(hc, max_h)}   T {td:>2} {_spark_bar(td, max_t)}")
+
+    per_habit = list(stats["per_habit"])
+    if per_habit:
+        lines.append("")
+        lines.append("По привычкам:")
+        for h in per_habit:
+            mark = "✅" if h["done_today"] else "—"
+            last = h["last_done"] or "никогда"
+            lines.append(
+                f"{mark} #{h['id']} {h['name']} | стрик {h['streak']} | всего {h['total_done']} | последний {last}"
+            )
+
+    return "\n".join(lines)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: BotState = context.application.bot_data["state"]
     telegram_id, chat_id = _user_ids(update)
@@ -142,11 +263,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(  # type: ignore[union-attr]
         "Привет! Я помогу вести привычки и задачи.\n\n" + HELP_TEXT,
+        reply_markup=_main_menu(),
     )
 
 
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Меню:", reply_markup=_main_menu())  # type: ignore[union-attr]
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)  # type: ignore[union-attr]
+    await update.message.reply_text(HELP_TEXT, reply_markup=_main_menu())  # type: ignore[union-attr]
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(AWAITING_KEY, None)
+    await update.message.reply_text("Ок, отменил.", reply_markup=_main_menu())  # type: ignore[union-attr]
 
 
 async def cmd_addhabit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -155,7 +286,7 @@ async def cmd_addhabit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     name = " ".join(context.args).strip()
     if not name:
-        await update.message.reply_text("Использование: /addhabit <название>")  # type: ignore[union-attr]
+        await update.message.reply_text("Использование: /addhabit «название»")  # type: ignore[union-attr]
         return
 
     hid = await _db_call(state, state.db.add_habit, telegram_id, chat_id, name)
@@ -177,7 +308,7 @@ async def cmd_habitdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     telegram_id, _chat_id = _user_ids(update)
 
     if not context.args:
-        await update.message.reply_text("Использование: /habitdone <id>")  # type: ignore[union-attr]
+        await update.message.reply_text("Использование: /habitdone «id»")  # type: ignore[union-attr]
         return
     try:
         hid = int(context.args[0])
@@ -194,7 +325,7 @@ async def cmd_delhabit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     telegram_id, _chat_id = _user_ids(update)
 
     if not context.args:
-        await update.message.reply_text("Использование: /delhabit <id>")  # type: ignore[union-attr]
+        await update.message.reply_text("Использование: /delhabit «id»")  # type: ignore[union-attr]
         return
     try:
         hid = int(context.args[0])
@@ -212,7 +343,7 @@ async def cmd_addtask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     text = " ".join(context.args).strip()
     if not text:
-        await update.message.reply_text("Использование: /addtask <текст>")  # type: ignore[union-attr]
+        await update.message.reply_text("Использование: /addtask «текст»")  # type: ignore[union-attr]
         return
 
     tid = await _db_call(state, state.db.add_task, telegram_id, chat_id, text)
@@ -234,7 +365,7 @@ async def cmd_taskdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     telegram_id, _chat_id = _user_ids(update)
 
     if not context.args:
-        await update.message.reply_text("Использование: /taskdone <id>")  # type: ignore[union-attr]
+        await update.message.reply_text("Использование: /taskdone «id»")  # type: ignore[union-attr]
         return
     try:
         tid = int(context.args[0])
@@ -251,7 +382,7 @@ async def cmd_deltask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     telegram_id, _chat_id = _user_ids(update)
 
     if not context.args:
-        await update.message.reply_text("Использование: /deltask <id>")  # type: ignore[union-attr]
+        await update.message.reply_text("Использование: /deltask «id»")  # type: ignore[union-attr]
         return
     try:
         tid = int(context.args[0])
@@ -372,6 +503,107 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n".join(parts))  # type: ignore[union-attr]
 
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: BotState = context.application.bot_data["state"]
+    telegram_id, chat_id = _user_ids(update)
+    await _db_call(state, state.db.get_or_create_user, telegram_id, chat_id)
+    stats = await _db_call(state, state.db.get_stats, telegram_id)
+    await update.message.reply_text(_stats_detailed_text(stats), reply_markup=_main_menu())  # type: ignore[union-attr]
+
+
+async def cmd_stats_short(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: BotState = context.application.bot_data["state"]
+    telegram_id, chat_id = _user_ids(update)
+    await _db_call(state, state.db.get_or_create_user, telegram_id, chat_id)
+    stats = await _db_call(state, state.db.get_stats, telegram_id)
+    await update.message.reply_text(_stats_short_text(stats), reply_markup=_main_menu())  # type: ignore[union-attr]
+
+
+async def cmd_reminder_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: BotState = context.application.bot_data["state"]
+    telegram_id, chat_id = _user_ids(update)
+    await _db_call(state, state.db.get_or_create_user, telegram_id, chat_id)
+    hhmm = await _db_call(state, state.db.get_reminder_time, telegram_id)
+    if hhmm:
+        text = f"Текущее напоминание: ежедневно в {hhmm} (UTC)\n\nИзменить: /setreminder HH:MM\nВыключить: /reminderoff"
+    else:
+        text = "Напоминания выключены.\n\nВключить: /setreminder HH:MM (UTC)"
+    await update.message.reply_text(text, reply_markup=_main_menu())  # type: ignore[union-attr]
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles menu buttons + quick-create flows.
+    """
+    state: BotState = context.application.bot_data["state"]
+    telegram_id, chat_id = _user_ids(update)
+
+    text = (update.message.text or "").strip()  # type: ignore[union-attr]
+
+    # Menu buttons
+    if text == BTN_ADD_TASK:
+        context.user_data[AWAITING_KEY] = AWAIT_TASK
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Напиши текст задачи одним сообщением.\nОтмена: /cancel",
+            reply_markup=_main_menu(),
+        )
+        return
+    if text == BTN_ADD_HABIT:
+        context.user_data[AWAITING_KEY] = AWAIT_HABIT
+        await update.message.reply_text(  # type: ignore[union-attr]
+            "Напиши название привычки одним сообщением.\nОтмена: /cancel",
+            reply_markup=_main_menu(),
+        )
+        return
+    if text == BTN_TASKS:
+        await cmd_tasks(update, context)
+        return
+    if text == BTN_HABITS:
+        await cmd_habits(update, context)
+        return
+    if text == BTN_SUMMARY:
+        await cmd_summary(update, context)
+        return
+    if text == BTN_STATS:
+        await cmd_stats(update, context)
+        return
+    if text == BTN_STATS_SHORT:
+        await cmd_stats_short(update, context)
+        return
+    if text == BTN_REMINDER:
+        await cmd_reminder_info(update, context)
+        return
+    if text == BTN_HELP:
+        await cmd_help(update, context)
+        return
+    if text == BTN_CANCEL:
+        await cmd_cancel(update, context)
+        return
+
+    # Quick-create mode
+    awaiting = context.user_data.get(AWAITING_KEY)
+    if awaiting == AWAIT_TASK:
+        payload = text.strip()
+        if not payload:
+            await update.message.reply_text("Пусто. Напиши текст задачи или /cancel")  # type: ignore[union-attr]
+            return
+        await _db_call(state, state.db.get_or_create_user, telegram_id, chat_id)
+        tid = await _db_call(state, state.db.add_task, telegram_id, chat_id, payload)
+        context.user_data.pop(AWAITING_KEY, None)
+        await update.message.reply_text(f"Добавил задачу #{tid}: {payload}", reply_markup=_main_menu())  # type: ignore[union-attr]
+        return
+    if awaiting == AWAIT_HABIT:
+        payload = text.strip()
+        if not payload:
+            await update.message.reply_text("Пусто. Напиши название привычки или /cancel")  # type: ignore[union-attr]
+            return
+        await _db_call(state, state.db.get_or_create_user, telegram_id, chat_id)
+        hid = await _db_call(state, state.db.add_habit, telegram_id, chat_id, payload)
+        context.user_data.pop(AWAITING_KEY, None)
+        await update.message.reply_text(f"Добавил привычку #{hid}: {payload}", reply_markup=_main_menu())  # type: ignore[union-attr]
+        return
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: BotState = context.application.bot_data["state"]
     query = update.callback_query
@@ -434,7 +666,9 @@ def build_app(token: str, db_path: str) -> Application:
     app.bot_data["state"] = state
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.add_handler(CommandHandler("addhabit", cmd_addhabit))
     app.add_handler(CommandHandler("habits", cmd_habits))
@@ -449,8 +683,12 @@ def build_app(token: str, db_path: str) -> Application:
     app.add_handler(CommandHandler("setreminder", cmd_setreminder))
     app.add_handler(CommandHandler("reminderoff", cmd_reminderoff))
     app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("stats_short", cmd_stats_short))
+    app.add_handler(CommandHandler("reminder", cmd_reminder_info))
 
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
 
 
